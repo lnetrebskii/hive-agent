@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { truncateOldMessages, estimateMessageTokens, ContextManager } from './context-manager.js'
+import { truncateOldMessages, estimateMessageTokens, ContextManager, sanitizeHistory } from './context-manager.js'
 import type { Message } from './types.js'
 
 // Helpers to build messages concisely
@@ -205,5 +205,180 @@ describe('ContextManager', () => {
         }
       }
     }
+  })
+})
+
+// ============================================================
+// Orphaned tool_use detection and repair
+// ============================================================
+// Bug: When __ask_user__ or interruption occurs in executor.ts,
+// history is saved with assistant tool_use blocks that have no
+// matching user tool_result. When this history is later sent to
+// the Claude API (after context truncation or on resume), the API
+// rejects it with:
+//   "tool_use ids were found without tool_result blocks immediately after"
+// ============================================================
+
+/**
+ * Helper: verify that every tool_use block in messages has a matching
+ * tool_result in the immediately following user message.
+ */
+function assertNoOrphanedToolUse(messages: Message[]): void {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    if (typeof msg.content === 'string') continue
+
+    const toolUseBlocks = msg.content.filter(
+      (b): b is { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> } =>
+        b.type === 'tool_use'
+    )
+
+    if (toolUseBlocks.length === 0) continue
+
+    // There must be a following user message with tool_results
+    const next = messages[i + 1]
+    expect(next, `tool_use at message[${i}] has no following message`).toBeDefined()
+    expect(next.role, `message after tool_use at [${i}] must be user`).toBe('user')
+    expect(typeof next.content, `message after tool_use at [${i}] must have content blocks`).not.toBe('string')
+
+    for (const toolUse of toolUseBlocks) {
+      const hasResult = (next.content as any[]).some(
+        (b: any) => b.type === 'tool_result' && b.tool_use_id === toolUse.id
+      )
+      expect(hasResult, `tool_use ${toolUse.id} (${toolUse.name}) at message[${i}] has no matching tool_result`).toBe(true)
+    }
+  }
+}
+
+describe('sanitizeHistory', () => {
+  it('removes orphaned tool_use at the end of history (from __ask_user__)', () => {
+    // This is the exact scenario from executor.ts:
+    // 1. LLM responds with [text, tool_use __ask_user__]
+    // 2. Assistant message pushed to history
+    // 3. Return immediately — no tool_result added
+    const messages: Message[] = [
+      userText('analyze this session'),
+      assistantToolUse('t1', '__shell__'),
+      userToolResult('t1', 'file contents here'),
+      assistantTextAndToolUse('I need more information', 'ask_1', '__ask_user__'),
+      // ↑ orphaned: no tool_result for ask_1
+    ]
+
+    const result = sanitizeHistory(messages)
+    assertNoOrphanedToolUse(result)
+  })
+
+  it('removes orphaned tool_use at the end from interruption between tools', () => {
+    // executor.ts: interruption after pushing assistant message but before
+    // pushing tool results. Multiple tool_use blocks, none with results.
+    const messages: Message[] = [
+      userText('start'),
+      assistantToolUse('t1', '__shell__'),
+      userToolResult('t1', 'ok'),
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 't2', name: '__shell__', input: { command: 'cat file' } },
+          { type: 'tool_use', id: 't3', name: '__shell__', input: { command: 'ls' } },
+        ],
+      },
+      // ↑ orphaned: no tool_results for t2 and t3
+    ]
+
+    const result = sanitizeHistory(messages)
+    assertNoOrphanedToolUse(result)
+  })
+
+  it('keeps valid tool_use/tool_result pairs intact', () => {
+    const messages: Message[] = [
+      userText('hello'),
+      assistantToolUse('t1', '__shell__'),
+      userToolResult('t1', 'world'),
+      assistantText('done'),
+    ]
+
+    const result = sanitizeHistory(messages)
+    expect(result).toEqual(messages)
+  })
+
+  it('handles history with orphan in the middle (from synthetic __ask_user__)', () => {
+    // This happens with sub-agent needs_input flow in executor.ts:
+    // 1. Sub-agent tool result is added
+    // 2. Synthetic __ask_user__ tool_use is pushed as assistant message
+    // 3. On resume, agent.ts adds tool_result for __ask_user__
+    // 4. Agent continues, does more work
+    // 5. Then context truncation removes the tool_result but keeps the tool_use
+    //    (if groupMessages fails to pair them correctly)
+    //
+    // Simulating: valid history where truncation wrongly separated a pair
+    const messages: Message[] = [
+      userText('analyze'),
+      // Valid pair
+      assistantToolUse('t1', '__shell__'),
+      userToolResult('t1', 'transcript content'),
+      // Orphaned tool_use (tool_result was lost)
+      assistantToolUse('ask_1', '__ask_user__'),
+      // Conversation continues after that orphan
+      assistantText('Based on the analysis...'),
+      userText('thanks'),
+    ]
+
+    const result = sanitizeHistory(messages)
+    assertNoOrphanedToolUse(result)
+    // Should still contain the valid messages
+    expect(result.length).toBeGreaterThanOrEqual(3) // at least: user, pair, and some continuation
+  })
+
+  it('adds dummy tool_result for orphaned tool_use blocks', () => {
+    // Rather than removing the assistant message entirely,
+    // add a tool_result with an error/cancelled status
+    const messages: Message[] = [
+      userText('hello'),
+      assistantTextAndToolUse('let me check', 'orphan_1', '__shell__'),
+      // No tool_result for orphan_1
+    ]
+
+    const result = sanitizeHistory(messages)
+    assertNoOrphanedToolUse(result)
+
+    // The assistant message should still be there (it has text content too)
+    const assistantMsg = result.find(
+      m => m.role === 'assistant' && typeof m.content !== 'string' &&
+        m.content.some(b => b.type === 'text')
+    )
+    expect(assistantMsg).toBeDefined()
+  })
+})
+
+describe('truncateOldMessages with orphaned input', () => {
+  it('should not output orphaned tool_use even when input has orphans', () => {
+    // If history loaded from storage has orphaned tool_use blocks,
+    // truncateOldMessages should not pass them through to the output
+    const messages: Message[] = [
+      userText('start'),
+      assistantToolUse('t1', '__shell__'),
+      userToolResult('t1', 'ok'),
+      assistantToolUse('orphan_1', '__ask_user__'),
+      // ↑ orphaned — no tool_result
+    ]
+
+    const result = truncateOldMessages(messages, 100000)
+    assertNoOrphanedToolUse(result)
+  })
+})
+
+describe('ContextManager with orphaned input', () => {
+  it('should sanitize orphaned tool_use before returning', () => {
+    const cm = new ContextManager(100000)
+    const messages: Message[] = [
+      userText('start'),
+      assistantToolUse('t1', '__shell__'),
+      userToolResult('t1', 'ok'),
+      assistantToolUse('orphan_1', '__ask_user__'),
+      // ↑ orphaned — no tool_result
+    ]
+
+    const result = cm.manageContext(messages)
+    assertNoOrphanedToolUse(result)
   })
 })
